@@ -1,0 +1,125 @@
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+import time
+
+SERVICE_KEY = ""
+BASE_URL = "http://apis.data.go.kr/1230000/ad/BidPublicInfoService"
+
+OPERATIONS = {
+    "공사": "getBidPblancListInfoCnstwkPPSSrch",
+    "용역": "getBidPblancListInfoServcPPSSrch",
+    "외자": "getBidPblancListInfoFrgcptPPSSrch",
+    "물품": "getBidPblancListInfoThngPPSSrch"
+}
+
+class G2BBidCollector:
+    def __init__(self, service_key, target_instt):
+        self.service_key = service_key
+        self.target_instt = target_instt
+
+    def get_date_chunks(self, start_date, end_date):
+        chunks = []
+        current_start = start_date
+        while current_start <= end_date:
+            current_end = current_start + timedelta(days=29)
+            if current_end > end_date:
+                current_end = end_date
+            str_start = current_start.strftime('%Y%m%d%H%M')
+            str_end = current_end.strftime('%Y%m%d%H%M')
+            chunks.append((str_start, str_end))
+            current_start = current_end + timedelta(minutes=1)
+        return chunks
+
+    def fetch_data(self, operation_name, operation_code, start_dt, end_dt):
+        url = f"{BASE_URL}/{operation_code}"
+        all_rows = []
+        page_no = 1
+        while True:
+            params = {
+                'ServiceKey': self.service_key,
+                'numOfRows': '900',
+                'pageNo': str(page_no),
+                'inqryDiv': '1',
+                'inqryBgnDt': start_dt,
+                'inqryEndDt': end_dt,
+                'type': 'xml'
+            }
+            try:
+                response = requests.get(url, params=params, timeout=30)
+                if response.status_code != 200:
+                    break
+                root = ET.fromstring(response.content)
+                result_msg = root.find('.//resultMsg').text if root.find('.//resultMsg') is not None else ""
+                if "NO DATA" in result_msg.upper() or "조회된 데이터가 없습니다" in result_msg:
+                    break
+                items = root.findall('.//item')
+                if not items:
+                    break
+                for item in items:
+                    ntce_instt_nm = self._get_text(item, 'ntceInsttNm')
+                    dminstt_nm = self._get_text(item, 'dminsttNm')
+                    if self.target_instt in ntce_instt_nm or self.target_instt in dminstt_nm:
+                        row = {
+                            '분야': operation_name,
+                            '공고번호': self._get_text(item, 'bidNtceNo'),
+                            '공고명': self._get_text(item, 'bidNtceNm'),
+                            '공고기관': ntce_instt_nm,
+                            '수요기관': dminstt_nm,
+                            '담당자명': self._get_text(item, 'ntceInsttOfclNm'),
+                            '전화번호': self._get_text(item, 'ntceInsttOfclTelNo'),
+                            '이메일': self._get_text(item, 'ntceInsttOfclEmailAdrs'),
+                            '공고일시': self._get_text(item, 'bidNtceDt')
+                        }
+                        all_rows.append(row)
+                if len(items) < int(params['numOfRows']):
+                    break
+                page_no += 1
+                time.sleep(0.2)
+            except Exception:
+                break
+        return all_rows
+
+    def _get_text(self, item, tag):
+        element = item.find(tag)
+        return element.text.strip() if element is not None and element.text else ""
+
+def main():
+    target_instt = input("조회할 기관명을 입력하세요: ").strip()
+    if not target_instt: return
+
+    start_date_str = input("시작 일자 (YYYY-MM-DD): ").strip()
+    end_date_str = input("마감 일자 (YYYY-MM-DD): ").strip()
+
+    try:
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").replace(hour=23, minute=59)
+        if start_date > end_date: return
+    except ValueError: return
+
+    collector = G2BBidCollector(SERVICE_KEY, target_instt)
+    date_chunks = collector.get_date_chunks(start_date, end_date)
+    total_data = []
+
+    for start_dt, end_dt in date_chunks:
+        for op_name, op_code in OPERATIONS.items():
+            rows = collector.fetch_data(op_name, op_code, start_dt, end_dt)
+            total_data.extend(rows)
+
+    if not total_data:
+        print("조회된 데이터가 없습니다.")
+        return
+
+    df = pd.DataFrame(total_data)
+    df_unique = df.drop_duplicates(subset=['공고번호'], keep='first')
+    file_name = f"G2B_{target_instt}_{start_date_str}_{end_date_str}.xlsx"
+    
+    try:
+        df_unique.to_excel(file_name, index=False)
+        print(f"저장 완료: {file_name}")
+    except Exception as e:
+        print(f"저장 실패: {e}")
+
+if __name__ == "__main__":
+    main()
